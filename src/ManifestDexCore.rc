@@ -1,0 +1,29 @@
+#include <winver.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904E4"
+        BEGIN
+            VALUE "CompanyName", "ManifestDeX"
+            VALUE "FileDescription", "ManifestDeX Core Proxy Library"
+            VALUE "PRODUCTVERSION", "1.0.0"
+            VALUE "InternalName", "manifestdexcore.dll"
+            VALUE "OriginalFilename", "manifestdexcore.dll"
+            VALUE "ProductName", "manifestdex.core"
+            VALUE "Comments", "https://manifestdex.com"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1252
+    END
+END
