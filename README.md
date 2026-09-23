@@ -271,5 +271,9 @@ build.bat
 - Debug: `build/Debug/ManifestDexCore.dll`, `build/Debug/dwmapi.dll`, `build/Debug/xinput1_4.dll`
 - Release: `build/Release/ManifestDexCore.dll`, `build/Release/dwmapi.dll`, `build/Release/xinput1_4.dll`
 
+### API keys
+
+The store button's built-in API keys are intentionally **not** in this repo (`kRyuuAuthKey` / `kHubcapKey` in `src/Utils/MDXBrowser/MDXBrowser.cpp` ship empty). Use your own: set the Hubcap key per-machine via Element settings (`%AppData%\ElementGui\settings.json` → `"HubcapKey"`), and bake your Ryuu key into your own local builds. Without keys those code paths fail gracefully. Never commit real keys.
+
 ## Disclaimer
 This project is provided for research and educational purposes only. You are responsible for complying with local laws, platform terms of service, and software licenses.

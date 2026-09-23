@@ -260,5 +260,9 @@ build.bat
 
 - Release: `build/Release/ManifestDexCore.dll`, `build/Release/dwmapi.dll`, `build/Release/xinput1_4.dll`
 
+### Claves de API
+
+Las claves de API integradas del botón de la tienda **no** están en este repositorio (`kRyuuAuthKey` / `kHubcapKey` en `src/Utils/MDXBrowser/MDXBrowser.cpp` se publican vacías). Usa las tuyas: configura la clave de Hubcap por máquina en los ajustes de Element (`%AppData%\ElementGui\settings.json` → `"HubcapKey"`) e integra tu clave de Ryuu en tus propias compilaciones locales. Sin claves esas rutas fallan de forma controlada. Nunca publiques claves reales.
+
 ## Descargo de responsabilidad
 Este proyecto se proporciona únicamente con fines de investigación y educativos. Eres responsable de cumplir con las leyes locales, los términos de servicio de la plataforma y las licencias de software correspondientes.

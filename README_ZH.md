@@ -267,5 +267,9 @@ build.bat
 - Debug：`build/Debug/OpenSteamTool.dll`、`build/Debug/dwmapi.dll`、`build/Debug/xinput1_4.dll`
 - Release：`build/Release/OpenSteamTool.dll`、`build/Release/dwmapi.dll`、`build/Release/xinput1_4.dll`
 
+### API 密钥
+
+商店按钮的内置 API 密钥**不在**本仓库中（`src/Utils/MDXBrowser/MDXBrowser.cpp` 中的 `kRyuuAuthKey` / `kHubcapKey` 为空）。请使用你自己的密钥：在 Element 设置中按机器配置 Hubcap 密钥（`%AppData%\ElementGui\settings.json` → `"HubcapKey"`），并在本地构建中填入你自己的 Ryuu 密钥。没有密钥时相关功能会受控失败。切勿提交真实密钥。
+
 ## 免责声明
 本项目仅供研究和教育目的使用。你负责遵守当地法律、平台服务条款和软件许可证。
