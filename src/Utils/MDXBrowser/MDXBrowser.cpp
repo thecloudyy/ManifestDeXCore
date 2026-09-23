@@ -1076,7 +1076,7 @@ std::vector<uint32_t> ParseCommaSeparatedIds(const std::string& str) {
 }
 
 // ── Ryuu direct download (Element app parity) ─────────────────────────
-// Element downloads lua + manifests straight from the Ryuu API
+// The store button downloads lua + manifests for THIS app only from Ryuu
 // (https://generator.ryuu.lol — see ElementGui/AppConfig.cs: ApiBaseUrl and
 // the compiled-in AuthKey) with no per-user login:
 //   GET /api/download/{appId}?file_type=lua      → raw "{appId}.lua"
