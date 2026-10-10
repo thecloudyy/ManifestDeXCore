@@ -1138,6 +1138,11 @@ std::string ReadHubcapKey() {
     if (v && !v->empty()) return *v;
     return kHubcapKey;
 }
+
+// Ryuu has no per-user settings override (unlike Hubcap): the only key is
+// the one baked in at build time. Skip the attempt entirely when empty so
+// a keyless fallback doesn't burn two failing HTTP calls per click.
+bool HasRyuuKey() { return kRyuuAuthKey[0] != '\0'; }
 } // namespace
 
 static bool EndsWithI(const std::string& s, const char* suffix) {
@@ -1826,21 +1831,33 @@ void HandleAddClick(uint32_t appId, const std::string& customDepots, const std::
     // 2. Notify page that we are loading
     g_devTools.QueueInjectScript("if (window.__mdxUpdateState) window.__mdxUpdateState(" + std::to_string(appId) + ", 'loading');");
 
-    // 3. Built-in install first (Element parity): which API it uses comes from
-    //    ElementGui settings -> Built-In Button Mode ("Hubcap" default, or "Ryuu").
-    //    Drops the lua to stplug-in plus the manifests to depotcache
-    //    (<Steam>\depotcache and <Steam>\config\depotcache). Best-effort — the
-    //    ManifestDeX flow below still runs afterwards for decryption keys and
-    //    custom depot/DLC selections, overwriting the lua with its version.
+    // 3. Built-in install first (Element parity): the preferred provider comes
+    //    from ElementGui settings -> Built-In Button Mode ("Hubcap" default,
+    //    or "Ryuu"). When it delivers nothing (no key, quota, 404...), the
+    //    other provider is tried as a fallback before giving up. Drops the
+    //    lua to stplug-in plus the manifests to depotcache (<Steam>\depotcache
+    //    and <Steam>\config\depotcache). Best-effort — the ManifestDeX flow
+    //    below still runs afterwards for decryption keys and custom depot/DLC
+    //    selections, overwriting the lua with its version.
     bool builtinOk = false;
     {
         std::string mode = ReadButtonMode();
-        if (mode == "ryuu") {
-            OSTP_LOG_INFO("MDXBrowser: Built-In Button Mode=Ryuu for appId={}", appId);
-            builtinOk = InstallFromRyuu(appId);
-        } else {
-            OSTP_LOG_INFO("MDXBrowser: Built-In Button Mode=Hubcap for appId={}", appId);
-            builtinOk = InstallFromHubcap(appId, ReadHubcapKey());
+        bool ryuuFirst = (mode == "ryuu");
+        for (int attempt = 0; attempt < 2 && !builtinOk; ++attempt) {
+            bool ryuu = (attempt == 0) ? ryuuFirst : !ryuuFirst;
+            if (ryuu) {
+                if (!HasRyuuKey()) {
+                    OSTP_LOG_INFO("MDXBrowser: Built-In Ryuu step skipped for appId={} (no key)", appId);
+                    continue;
+                }
+                OSTP_LOG_INFO("MDXBrowser: Built-In Button Mode=Ryuu for appId={}", appId);
+                builtinOk = InstallFromRyuu(appId);
+            } else {
+                OSTP_LOG_INFO("MDXBrowser: Built-In Button Mode=Hubcap for appId={}", appId);
+                builtinOk = InstallFromHubcap(appId, ReadHubcapKey());
+            }
+            if (!builtinOk && attempt == 0)
+                OSTP_LOG_INFO("MDXBrowser: Preferred provider delivered nothing for appId={}, trying fallback provider", appId);
         }
     }
 
