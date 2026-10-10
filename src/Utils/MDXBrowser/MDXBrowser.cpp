@@ -1464,6 +1464,347 @@ static bool InstallFromHubcap(uint32_t appId, const std::string& hubcapKey) {
     return luaInstalled || manifestCount > 0;
 }
 
+// ── ManifestDeX manifest fetch (ManifestDownloader parity) ──────────
+// Same method as Element's ManifestDownloader (ManifestService.cs):
+//   GET https://manifest.manifestdex.com/{gid} with UA ManifestDeX/1.0
+//     → plain-text request code (uint64); CDN host from the x-manifest-cdn
+//     response header, fallback https://cache7-ord1.steamcontent.com
+//   GET {cdn}/depot/{depot}/manifest/{gid}/5/{code} → zip holding the manifest
+// Throttle: the code API allows 60 requests/min, so code calls are spaced
+// ≥1100ms apart process-wide. Best-effort throughout: never fails the add.
+namespace {
+constexpr char kManifestCodeApi[] = "https://manifest.manifestdex.com";
+constexpr char kManifestCdnFallback[] = "https://cache7-ord1.steamcontent.com";
+
+std::mutex g_codeMutex;
+uint64_t g_lastCodeTick = 0;
+
+std::string ToLowerStr(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return s;
+}
+
+std::string TrimStr(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    size_t e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+
+// Value of a case-insensitive response header from raw CRLF headers.
+std::string FindResponseHeader(const std::string& rawHeaders, const std::string& name) {
+    std::string low = ToLowerStr(rawHeaders);
+    std::string key = ToLowerStr(name) + ":";
+    size_t pos = low.find(key);
+    if (pos == std::string::npos) return "";
+    size_t start = pos + key.size();
+    size_t end = low.find("\r\n", start);
+    return TrimStr(rawHeaders.substr(start, end == std::string::npos ? end : end - start));
+}
+
+// Depot ids from lua addappid() lines: addappid(depotid, digit, "hexkey").
+// Same shape as ManifestService.GetDepotIdsFromLua.
+std::vector<uint32_t> ParseLuaDepotIds(const std::string& lua) {
+    std::vector<uint32_t> ids;
+    size_t pos = 0;
+    while ((pos = lua.find("addappid", pos)) != std::string::npos) {
+        size_t paren = lua.find('(', pos + 8);
+        if (paren == std::string::npos) break;
+        size_t i = paren + 1;
+        while (i < lua.size() && (lua[i] == ' ' || lua[i] == '\t')) ++i;
+        uint32_t id = 0;
+        bool any = false;
+        while (i < lua.size() && lua[i] >= '0' && lua[i] <= '9') {
+            any = true;
+            id = id * 10 + (uint32_t)(lua[i] - '0');
+            ++i;
+        }
+        if (any && id != 0 &&
+            std::find(ids.begin(), ids.end(), id) == ids.end())
+            ids.push_back(id);
+        pos = i;
+    }
+    return ids;
+}
+
+// End (one past '}') of the object starting at openPos. Strings are honored
+// (braces inside quotes don't count); backslash escapes skipped (enough for
+// the steamcmd payloads we scope through).
+size_t FindObjectEnd(const std::string& json, size_t openPos) {
+    int depth = 0;
+    bool inStr = false;
+    for (size_t i = openPos; i < json.size(); ++i) {
+        char c = json[i];
+        if (inStr) {
+            if (c == '\\') { ++i; continue; }
+            if (c == '"') inStr = false;
+        } else if (c == '"') {
+            inStr = true;
+        } else if (c == '{') {
+            ++depth;
+        } else if (c == '}') {
+            if (--depth == 0) return i + 1;
+        }
+    }
+    return std::string::npos;
+}
+
+// [begin,end) of the object value of "key":{...} searched from fromPos and
+// bounded by scopeEnd. npos pair when absent/malformed.
+std::pair<size_t, size_t> FindKeyObject(const std::string& json, const std::string& key,
+                                        size_t fromPos, size_t scopeEnd) {
+    std::string pat = "\"" + key + "\"";
+    size_t pos = fromPos;
+    while ((pos = json.find(pat, pos)) != std::string::npos && pos < scopeEnd) {
+        size_t i = pos + pat.size();
+        while (i < scopeEnd && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n')) ++i;
+        if (i < scopeEnd && json[i] == ':') {
+            ++i;
+            while (i < scopeEnd && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n')) ++i;
+            if (i < scopeEnd && json[i] == '{') {
+                size_t end = FindObjectEnd(json, i);
+                if (end != std::string::npos && end <= scopeEnd + 1) return { i, end };
+                return { std::string::npos, std::string::npos };
+            }
+        }
+        pos += pat.size();
+    }
+    return { std::string::npos, std::string::npos };
+}
+
+std::optional<std::string> FindKeyString(const std::string& json, const std::string& key,
+                                         size_t fromPos, size_t scopeEnd) {
+    std::string pat = "\"" + key + "\"";
+    size_t pos = json.find(pat, fromPos);
+    if (pos == std::string::npos || pos >= scopeEnd) return std::nullopt;
+    size_t i = pos + pat.size();
+    auto skipWs = [&]() {
+        while (i < scopeEnd && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n')) ++i;
+    };
+    skipWs();
+    if (i >= scopeEnd || json[i] != ':') return std::nullopt;
+    ++i;
+    skipWs();
+    if (i >= scopeEnd || json[i] != '"') return std::nullopt;
+    ++i;
+    size_t start = i;
+    while (i < scopeEnd && json[i] != '"') {
+        if (json[i] == '\\') ++i;
+        ++i;
+    }
+    if (i >= scopeEnd) return std::nullopt;
+    return json.substr(start, i - start);
+}
+
+// Manifest gid for one depot via steamcmd appinfo:
+// data.{appId}.depots.{depotId}.manifests.public.gid
+// (mirrors ManifestService.GetManifestId).
+std::optional<std::string> GetSteamCmdManifestGid(const std::string& appIdStr, uint32_t depotId) {
+    std::string url = "https://api.steamcmd.net/v1/info/" + appIdStr;
+    auto res = OSTPlatform::Http::Execute(L"GET", url.c_str(), nullptr, 0,
+                                          nullptr, 5000, 5000, 10000, 30000);
+    if (!res.ok || res.status != 200 || res.body.empty()) {
+        OSTP_LOG_WARN("MDXBrowser: steamcmd appinfo failed for appId={} (ok={} status={})",
+                      appIdStr, res.ok, res.status);
+        return std::nullopt;
+    }
+    auto status = FindKeyString(res.body, "status", 0, res.body.size());
+    if (!status || ToLowerStr(*status) != "success") return std::nullopt;
+
+    auto data = FindKeyObject(res.body, "data", 0, res.body.size());
+    if (data.first == std::string::npos) return std::nullopt;
+    auto app = FindKeyObject(res.body, appIdStr, data.first, data.second);
+    if (app.first == std::string::npos) return std::nullopt;
+    auto depots = FindKeyObject(res.body, "depots", app.first, app.second);
+    if (depots.first == std::string::npos) return std::nullopt;
+    auto depot = FindKeyObject(res.body, std::to_string(depotId), depots.first, depots.second);
+    if (depot.first == std::string::npos) return std::nullopt;
+    auto manifests = FindKeyObject(res.body, "manifests", depot.first, depot.second);
+    if (manifests.first == std::string::npos) return std::nullopt;
+    auto pub = FindKeyObject(res.body, "public", manifests.first, manifests.second);
+    if (pub.first == std::string::npos) return std::nullopt;
+    auto gid = FindKeyString(res.body, "gid", pub.first, pub.second);
+    if (!gid || gid->empty() || *gid == "0") return std::nullopt;
+    return gid;
+}
+
+struct ManifestCode {
+    uint64_t code = 0;
+    std::string cdn;
+};
+
+// Request code for a manifest gid. Handles 429 (Retry-After, clamped 1..30s)
+// and 502/504 with bounded retries. Null when unavailable.
+std::optional<ManifestCode> RequestManifestCode(const std::string& gidStr) {
+    uint64_t gid = 0;
+    try { gid = std::stoull(gidStr); } catch (...) { return std::nullopt; }
+    if (gid == 0) return std::nullopt;
+
+    std::wstring uaHeader = L"User-Agent: ManifestDeX/1.0\r\n";
+    std::string url = std::string(kManifestCodeApi) + "/" + gidStr;
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        {
+            std::lock_guard<std::mutex> lk(g_codeMutex);
+            uint64_t now = GetTickCount64();
+            if (g_lastCodeTick != 0 && now - g_lastCodeTick < 1100)
+                Sleep((DWORD)(1100 - (now - g_lastCodeTick)));
+            g_lastCodeTick = GetTickCount64();
+        }
+
+        auto res = OSTPlatform::Http::Execute(L"GET", url.c_str(), nullptr, 0,
+                                              uaHeader.c_str(), 5000, 5000, 10000, 20000);
+        if (res.ok && res.status == 200) {
+            std::string body = TrimStr(res.body);
+            uint64_t code = 0;
+            try { code = std::stoull(body); } catch (...) { return std::nullopt; }
+            if (code == 0) return std::nullopt;
+            ManifestCode out;
+            out.code = code;
+            out.cdn = FindResponseHeader(res.headers, "x-manifest-cdn");
+            while (!out.cdn.empty() && out.cdn.back() == '/') out.cdn.pop_back();
+            if (out.cdn.empty()) out.cdn = kManifestCdnFallback;
+            return out;
+        }
+        if (res.ok && res.status == 429) {
+            unsigned secs = 10;
+            try {
+                std::string ra = FindResponseHeader(res.headers, "retry-after");
+                if (!ra.empty()) secs = (unsigned)std::stoul(ra);
+            } catch (...) {}
+            if (secs < 1) secs = 1;
+            if (secs > 30) secs = 30;
+            OSTP_LOG_WARN("MDXBrowser: manifest code 429 for gid={}, waiting {}s", gidStr, secs);
+            Sleep(secs * 1000);
+            continue;
+        }
+        if (res.ok && (res.status == 502 || res.status == 504)) {
+            Sleep(2000);
+            continue;
+        }
+        OSTP_LOG_WARN("MDXBrowser: manifest code failed for gid={} (ok={} status={})",
+                      gidStr, res.ok, res.status);
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+// Fetch one manifest through code + Steam CDN zip, installing
+// {depot}_{gid}.manifest to depotcache (+config/depotcache). Skips files
+// already on disk. Mirrors ManifestService.DownloadViaManifestDeXAsync.
+bool FetchManifestViaCode(uint32_t depotId, const std::string& gidStr,
+                          const ManifestCode& mc) {
+    if (g_steamInstallPath.empty()) return false;
+    std::string depotStr = std::to_string(depotId);
+    std::string fileName = depotStr + "_" + gidStr + ".manifest";
+
+    std::error_code ec;
+    std::filesystem::path depotDir = std::filesystem::path(g_steamInstallPath) / "depotcache";
+    std::filesystem::path depotDirLegacy = std::filesystem::path(g_steamInstallPath) / "config" / "depotcache";
+    std::filesystem::create_directories(depotDir, ec);
+    std::filesystem::create_directories(depotDirLegacy, ec);
+    ec.clear();
+    if (std::filesystem::exists(depotDir / fileName, ec) ||
+        std::filesystem::exists(depotDirLegacy / fileName, ec))
+        return true; // already installed (add-lua parity: never re-fetch)
+
+    std::string url = mc.cdn + "/depot/" + depotStr + "/manifest/" + gidStr +
+                      "/5/" + std::to_string(mc.code);
+    auto res = OSTPlatform::Http::Execute(L"GET", url.c_str(), nullptr, 0,
+                                          nullptr, 5000, 5000, 15000, 90000);
+    if (!res.ok || res.status != 200 || res.body.size() <= 4 ||
+        res.body[0] != 'P' || res.body[1] != 'K' ||
+        !HasZipEndOfCentralDirectory(res.body)) {
+        OSTP_LOG_WARN("MDXBrowser: manifest CDN fetch failed for depot={} gid={} (ok={} status={})",
+                      depotStr, gidStr, res.ok, res.status);
+        return false;
+    }
+
+    wchar_t tmpRoot[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, tmpRoot) == 0) return false;
+    std::filesystem::path workDir = std::filesystem::path(tmpRoot) /
+        ("mdx-manifest-" + depotStr + "-" + std::to_string(GetTickCount64()));
+    std::filesystem::create_directories(workDir, ec);
+    if (ec) return false;
+
+    bool installed = false;
+    std::filesystem::path zipPath = workDir / (fileName + ".zip");
+    {
+        std::ofstream zf(zipPath, std::ios::binary | std::ios::trunc);
+        if (zf) zf.write(res.body.data(), static_cast<std::streamsize>(res.body.size()));
+    }
+    std::filesystem::path extractDir = workDir / "ex";
+    std::filesystem::create_directories(extractDir, ec);
+    if (ExtractZipViaOsTools(zipPath, extractDir)) {
+        std::filesystem::path picked;
+        std::error_code iterEc;
+        for (auto it = std::filesystem::recursive_directory_iterator(
+                 extractDir, std::filesystem::directory_options::skip_permission_denied, iterEc);
+             it != std::filesystem::recursive_directory_iterator(); ++it) {
+            if (iterEc) break;
+            if (!it->is_regular_file(iterEc)) continue;
+            std::string name = it->path().filename().string();
+            if (picked.empty() || EndsWithI(name, ".manifest")) {
+                picked = it->path();
+                if (EndsWithI(name, ".manifest")) break;
+            }
+        }
+        if (!picked.empty()) {
+            bool oneOk = false;
+            for (const auto& dir : { depotDir, depotDirLegacy }) {
+                std::error_code cpEc;
+                if (std::filesystem::exists(dir / fileName, cpEc)) { oneOk = true; continue; }
+                std::filesystem::copy_file(picked, dir / fileName, cpEc);
+                if (!cpEc) oneOk = true;
+                else OSTP_LOG_WARN("MDXBrowser: manifest copy failed ({}): {}",
+                                   (dir / fileName).string(), cpEc.message());
+            }
+            installed = oneOk;
+        } else {
+            OSTP_LOG_WARN("MDXBrowser: manifest zip had no usable entry for depot={} gid={}", depotStr, gidStr);
+        }
+    } else {
+        OSTP_LOG_WARN("MDXBrowser: manifest zip extract failed for depot={} gid={}", depotStr, gidStr);
+    }
+
+    std::error_code rmEc;
+    std::filesystem::remove_all(workDir, rmEc);
+    if (installed)
+        OSTP_LOG_INFO("MDXBrowser: installed manifest {} (depot={} gid={})", fileName, depotStr, gidStr);
+    return installed;
+}
+
+// Ensure manifests for an add: depots from the lua's addappid() lines
+// (fallback: the depot list the click already resolved), gid per depot via
+// steamcmd, bytes via manifest.manifestdex.com + Steam CDN. Returns installed
+// count. Same shape as adding a lua in Element (lua + depotcache manifests).
+int EnsureManifestsForAdd(uint32_t appId, const std::string& luaContent,
+                           const std::vector<uint32_t>& fallbackDepots) {
+    std::string appIdStr = std::to_string(appId);
+    std::vector<uint32_t> depots = ParseLuaDepotIds(luaContent);
+    if (depots.empty()) depots = fallbackDepots;
+    if (depots.empty()) {
+        OSTP_LOG_WARN("MDXBrowser: no depots to fetch manifests for appId={}", appId);
+        return 0;
+    }
+    int installed = 0;
+    for (uint32_t depot : depots) {
+        auto gid = GetSteamCmdManifestGid(appIdStr, depot);
+        if (!gid) {
+            OSTP_LOG_WARN("MDXBrowser: no manifest gid for appId={} depot={}", appId, depot);
+            continue;
+        }
+        auto code = RequestManifestCode(*gid);
+        if (!code) continue;
+        if (FetchManifestViaCode(depot, *gid, *code)) ++installed;
+    }
+    OSTP_LOG_INFO("MDXBrowser: manifests for appId={}: {}/{} installed",
+                  appId, installed, (int)depots.size());
+    return installed;
+}
+} // namespace
+
 // Native click handler: reads auth, fetches basic depots or uses custom, generates and saves .lua
 void HandleAddClick(uint32_t appId, const std::string& customDepots, const std::string& customDlcs) {
     OSTP_LOG_INFO("MDXBrowser: Handling add click for appId={}, customDepots='{}', customDlcs='{}'", appId, customDepots, customDlcs);
@@ -1854,7 +2195,13 @@ void HandleAddClick(uint32_t appId, const std::string& customDepots, const std::
 
     OSTP_LOG_INFO("MDXBrowser: Successfully wrote {}.lua ({} bytes)", appId, luaContent.size());
 
-    // 8. Notify page that we successfully added the game
+    // 8. Manifests, same as adding a lua in Element: depots from the lua's
+    //    addappid() lines (fallback: the depots resolved above), gid per depot
+    //    via steamcmd, bytes via manifest.manifestdex.com + Steam CDN.
+    //    Best-effort — the lua is the deliverable.
+    EnsureManifestsForAdd(appId, luaContent, depotIds);
+
+    // 9. Notify page that we successfully added the game
     g_devTools.QueueInjectScript("if (window.__mdxUpdateState) window.__mdxUpdateState(" + std::to_string(appId) + ", 'success');");
 }
 

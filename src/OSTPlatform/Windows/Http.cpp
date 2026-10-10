@@ -327,6 +327,23 @@ Result Execute(const wchar_t* method,
             OSTP_LOG_WARN("{} - WinHttpQueryHeaders(status) failed (error={})", url ? url : "", GetLastError());
         }
 
+        // Capture raw response headers for callers that need them
+        // (e.g. x-manifest-cdn, Retry-After). Best-effort: empty on failure.
+        DWORD hdrLen = 0;
+        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_RAW_HEADERS_CRLF,
+            WINHTTP_HEADER_NAME_BY_INDEX, WINHTTP_NO_OUTPUT_BUFFER,
+            &hdrLen, WINHTTP_NO_HEADER_INDEX);
+        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && hdrLen >= sizeof(wchar_t)) {
+            std::wstring whdr(hdrLen / sizeof(wchar_t), L'\0');
+            DWORD hdrLenBytes = hdrLen;
+            if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                    WINHTTP_HEADER_NAME_BY_INDEX, whdr.data(),
+                    &hdrLenBytes, WINHTTP_NO_HEADER_INDEX)) {
+                if (!whdr.empty() && whdr.back() == L'\0') whdr.pop_back();
+                r.headers = Encoding::WideToUtf8(whdr);
+            }
+        }
+
         DWORD avail = 0;
         while (true) {
             if (!WinHttpQueryDataAvailable(hRequest, &avail)) {

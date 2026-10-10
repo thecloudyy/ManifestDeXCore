@@ -10,6 +10,10 @@ namespace OSTPlatform::Http {
         uint32_t status = 0;
         // True once WinHTTP produced a response; callers must still check status for 2xx.
         bool ok = false;
+        // Raw response headers (CRLF-separated, status line included). Empty
+        // when no response was received. Callers needing e.g. x-manifest-cdn
+        // or Retry-After parse this themselves.
+        std::string headers;
     };
 
     Result Execute(const wchar_t* method,
