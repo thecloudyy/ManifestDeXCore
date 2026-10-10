@@ -274,7 +274,10 @@ Result Execute(const wchar_t* method,
     pinCtx.url = url;
 
     if (isPinnedHost) {
-        static constexpr wchar_t kUserAgentHeader[] = L"User-Agent: ManifestDeXCore/1.0\r\n";
+        // api.manifestdex.com only serves clients identifying as ManifestDeX/1.0
+        // (anything else gets HTTP 403, which used to break the store button's
+        // details/generate/download calls).
+        static constexpr wchar_t kUserAgentHeader[] = L"User-Agent: ManifestDeX/1.0\r\n";
         if (!WinHttpAddRequestHeaders(
             hRequest,
             kUserAgentHeader,
